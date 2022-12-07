@@ -15,9 +15,7 @@
 #include "paddle/extension.h"
 
 std::vector<std::vector<int64_t>> AccMergeInferShape(
-    const std::vector<int64_t> &acc,
-    const std::vector<int64_t> &total,
-    const int &ring_id) {
+    const std::vector<int64_t> &acc, const std::vector<int64_t> &total) {
   return {{2}, {2}};
 }
 
@@ -29,6 +27,5 @@ std::vector<paddle::DataType> AccMergeInferDType(paddle::DataType acc,
 PD_BUILD_OP(acc_merge)
     .Inputs({"Acc", "Total"})
     .Outputs({"Out", "Step"})
-    .Attrs({"ring_id: int"})
     .SetInferShapeFn(PD_INFER_SHAPE(AccMergeInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(AccMergeInferDType));

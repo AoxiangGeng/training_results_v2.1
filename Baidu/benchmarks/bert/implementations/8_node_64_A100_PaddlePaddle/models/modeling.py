@@ -31,7 +31,7 @@ import utility
 
 from bert_padding import generate_mask
 try:
-    from custom_setup_ops import custom_fmha, custom_fused_dropout_residual_ln, custom_fused_dense, custom_fused_dense_gelu_dense, flash_attn
+    from custom_setup_ops import custom_fmha, custom_fused_dropout_residual_ln, custom_fused_dense
 except ImportError as e:
     print('custom_setup_ops import error: {}'.format(e))
 
@@ -301,14 +301,10 @@ class TFCkptHelper:
                     tf_var_name = prefix + name + "/"
                     weight_name = tf_var_name + "kernel"
                     bias_name = tf_var_name + "bias"
-
+                    
                     if utility.get_trainer_id() == 0:
-                        paddle_bert_print_event(
-                            key='weights_initialization',
-                            metadata={'tensor': weight_name})
-                        paddle_bert_print_event(
-                            key='weights_initialization',
-                            metadata={'tensor': bias_name})
+                        paddle_bert_print_event(key='weights_initialization', metadata={'tensor':weight_name})
+                        paddle_bert_print_event(key='weights_initialization', metadata={'tensor':bias_name})
 
                     if need_transpose:
                         weights.append(transpose_2d(tf_vars[weight_name]))
@@ -337,9 +333,7 @@ class TFCkptHelper:
         for idx, (pd_var_name,
                   tf_var_name) in enumerate(self.pd_vars_to_tf_vars.items()):
             if utility.get_trainer_id() == 0:
-                paddle_bert_print_event(
-                    key='weights_initialization',
-                    metadata={'tensor': tf_var_name})
+                paddle_bert_print_event(key='weights_initialization', metadata={'tensor':tf_var_name})
             var_value = tf_vars[tf_var_name]
             if "output_weights" in tf_var_name or pd_var_name in self.transpose_vars:
                 if utility.get_trainer_id() == 0:
@@ -382,13 +376,10 @@ class TFCkptHelper:
             slices = []
             n = len(pd_var_shape)
             for i in range(n):
-                if i == 0:
-                    assert pd_var_shape[i] >= tf_var_shape[i]
-                else:
-                    assert pd_var_shape[i] == tf_var_shape[i]
+                assert pd_var_shape[i] >= tf_var_shape[i]
                 slices.append(slice(0, tf_var_shape[i], 1))
             new_var_value = np.zeros(pd_var_shape, dtype=var_value.dtype)
-            new_var_value[slices[0]] = var_value
+            new_var_value[slices] = var_value
             var_value = new_var_value
 
         if pd_var._dtype() == paddle.float16:
@@ -548,7 +539,6 @@ class FMHA(Layer):
         self.fused_qkv_bias = config.fused_bias_mha
         self.weight_transpose = True
         self.use_unpad_fmha_mke_opt = config.unpad_fmha_mke_opt
-        self.fmha_func = flash_attn if config.use_flash_attn else custom_fmha
         assert self.d * self.h == self.hidden_size, "Invalid hidden size/num_heads"
 
         # create_parameter
@@ -594,8 +584,8 @@ class FMHA(Layer):
         qkv = paddle.reshape(qkv, [-1, 3, self.h, self.d])
         #print("qkv.shape", qkv.shape)
         # FMHA: max_s =  var memcpy_0.tmp_0 : LOD_TENSOR.shape(1,).dtype(int32).stop_gradient(False)
-        print("FMHA: max_s = ", max_s)
-        out, _ = self.fmha_func(
+        #print("FMHA: max_s = ", max_s)
+        out, _ = custom_fmha(
             qkv,
             cu_seqlens,
             host_cu_seqlens,
@@ -732,7 +722,6 @@ class BertEncoder(Layer):
         self.unpad_embed = config.unpad_embed
         self.unpad_fmha = config.unpad_fmha
         self.pad_fmha = config.pad_fmha
-        self.fused_dense_gelu_dense = config.fused_dense_gelu_dense
         self.hidden_size = config.hidden_size
         self.maxseqlen = config.max_seq_length
 
@@ -769,22 +758,12 @@ class BertEncoder(Layer):
 
             intermediate = layer.intermediate
             last_output = layer.output
-            if not self.fused_dense_gelu_dense:
-                ckpt.enc_intermediate_fc(
-                    [intermediate.dense.weight, intermediate.dense.bias], idx,
-                    intermediate.weight_transpose)
-                ckpt.enc_output_fc(
-                    [last_output.dense.weight, last_output.dense.bias], idx,
-                    last_output.weight_transpose)
-            else:
-                ckpt.enc_intermediate_fc([
-                    intermediate.dense_gelu_dense.weight1,
-                    intermediate.dense_gelu_dense.bias1
-                ], idx, intermediate.weight_transpose)
-                ckpt.enc_output_fc([
-                    intermediate.dense_gelu_dense.weight2,
-                    intermediate.dense_gelu_dense.bias2
-                ], idx, intermediate.weight_transpose)
+            ckpt.enc_intermediate_fc(
+                [intermediate.dense.weight, intermediate.dense.bias], idx,
+                intermediate.weight_transpose)
+            ckpt.enc_output_fc(
+                [last_output.dense.weight, last_output.dense.bias], idx,
+                last_output.weight_transpose)
             if last_output.fused_dropout:
                 ckpt.enc_output_norm([
                     last_output.fused_dropout_add_ln.weight,
@@ -1049,69 +1028,6 @@ class FusedDense(Layer):
         return out
 
 
-# linear + gelu + linear
-# TODO: support only nt (weight is transposed)
-class FusedDenseGeluDense(Layer):
-    def __init__(
-            self,
-            in_features,
-            intermediate_features,
-            out_features,
-            weight_transpose=True,  #true!
-            weight_attr=None,
-            bias_attr=None,
-            name=None):
-        super(FusedDenseGeluDense, self).__init__()
-        self._dtype = self._helper.get_default_dtype()
-        self._weight_attr = weight_attr
-        self._bias_attr = bias_attr
-        self.weight_transpose = weight_transpose
-        if weight_transpose:
-            self.weight1 = self.create_parameter(
-                shape=[intermediate_features, in_features],
-                attr=self._weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-            self.weight2 = self.create_parameter(
-                shape=[out_features, intermediate_features],
-                attr=self._weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-        else:
-            self.weight1 = self.create_parameter(
-                shape=[in_features, intermediate_features],
-                attr=self._weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-            self.weight2 = self.create_parameter(
-                shape=[intermediate_features, out_features],
-                attr=self._weight_attr,
-                dtype=self._dtype,
-                is_bias=False)
-        self.bias1 = self.create_parameter(
-            shape=[intermediate_features],
-            attr=self._bias_attr,
-            dtype=self._dtype,
-            is_bias=True)
-        self.bias2 = self.create_parameter(
-            shape=[out_features],
-            attr=self._bias_attr,
-            dtype=self._dtype,
-            is_bias=True)
-        self.name = name
-
-    def forward(self, hidden_states):
-        _, out, _ = custom_fused_dense_gelu_dense(
-            hidden_states,
-            self.weight1,
-            self.weight2,
-            self.bias1,
-            self.bias2,
-            transx=False,
-            transy=self.weight_transpose)
-        return out
-
-
 class BertSelfOutput(Layer):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
@@ -1134,7 +1050,7 @@ class BertSelfOutput(Layer):
             self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
-        print("selfoutput input: hidden_states.shape = ", hidden_states.shape)
+        #print("selfoutput input: hidden_states.shape = ", hidden_states.shape)
         hidden_states = self.dense(hidden_states)
         if not self.fused_dropout:
             hidden_states = self.dropout(hidden_states)
@@ -1150,39 +1066,24 @@ class BertIntermediate(Layer):
     def __init__(self, config):
         super(BertIntermediate, self).__init__()
         self.fused_fc_bias = config.fused_bias_fc
-        self.fused_dense_gelu_dense = config.fused_dense_gelu_dense
-        self.weight_transpose = config.weight_transpose
-        if self.fused_dense_gelu_dense:
-            self.dense_gelu_dense = FusedDenseGeluDense(
+        if not self.fused_fc_bias:
+            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+            self.weight_transpose = False
+            self.intermediate_act_fn = get_activation()
+        else:
+            self.weight_transpose = config.weight_transpose
+            self.dense = FusedDense(
                 config.hidden_size,
                 config.intermediate_size,
-                config.hidden_size,
-                weight_transpose=self.weight_transpose)
-        else:
-            if not self.fused_fc_bias:
-                self.dense = nn.Linear(config.hidden_size,
-                                       config.intermediate_size)
-                self.weight_transpose = False
-                self.intermediate_act_fn = get_activation()
-            else:
-                self.weight_transpose = config.weight_transpose
-                self.dense = FusedDense(
-                    config.hidden_size,
-                    config.intermediate_size,
-                    weight_transpose=self.weight_transpose,
-                    with_gelu=True)
+                weight_transpose=self.weight_transpose,
+                with_gelu=True)
 
     def forward(self, hidden_states):
-        if self.fused_dense_gelu_dense:
-            hidden_states = self.dense_gelu_dense(hidden_states)
+        if not self.fused_fc_bias:
+            hidden_states = self.dense(hidden_states)
+            hidden_states = self.intermediate_act_fn(hidden_states)
         else:
-            if not self.fused_fc_bias:
-                hidden_states = self.dense(hidden_states)
-                hidden_states = self.intermediate_act_fn(hidden_states)
-            else:
-                hidden_states = self.dense(hidden_states)
-        print("intermediate output: hidden_states.shape = ",
-              hidden_states.shape)
+            hidden_states = self.dense(hidden_states)
         return hidden_states
 
 
@@ -1191,7 +1092,6 @@ class BertOutput(Layer):
         super(BertOutput, self).__init__()
         self.fused_fc_bias = config.fused_bias_fc
         self.fused_dropout = config.fused_dropout_add_ln
-        self.fused_dense_gelu_dense = config.fused_dense_gelu_dense
         if not self.fused_fc_bias:
             self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
             self.weight_transpose = False
@@ -1212,9 +1112,7 @@ class BertOutput(Layer):
 
     def forward(self, hidden_states, input_tensor):
         #print("BertOutput, input.shape = ", hidden_states.shape)
-        if not self.fused_dense_gelu_dense:
-            hidden_states = self.dense(hidden_states)
-        print("final output: hidden_states.shape = ", hidden_states.shape)
+        hidden_states = self.dense(hidden_states)
         if not self.fused_dropout:
             hidden_states = self.dropout(hidden_states)
             hidden_states = hidden_states + input_tensor
@@ -1409,7 +1307,6 @@ class BertModel(nn.Layer):
         self.unpad = config.unpad
         self.pad_fmha = config.pad_fmha
         self.unpad_embed = config.unpad_embed
-        self.unpad_fmha = config.unpad_fmha
         self.pad_token_id = config.pad_token_id
         self.initializer_range = config.initializer_range
         self.num_hidden_layers = config.num_hidden_layers
@@ -1497,13 +1394,13 @@ class BertModel(nn.Layer):
                 attention_mask=attention_mask)
             cur_batch_size = None
             zero_tensor = None
-            # attention_indices = None
-            # new_attention_mask = None
-            # seqlen = None
-            # cu_seqlens = None
-            # host_cu_seqlens = None
-            # actual_seqlens = None
-            # maxseqlen_in_batch = None
+            attention_indices = None
+            new_attention_mask = None
+            seqlen = None
+            cu_seqlens = None
+            host_cu_seqlens = None
+            actual_seqlens = None
+            maxseqlen_in_batch = None
         else:
             embedding_output, cur_batch_size, zero_tensor = self.embeddings(
                 input_ids=input_ids,

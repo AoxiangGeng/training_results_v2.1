@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <chrono>
 #include <cstdint>
 #include <vector>
-
 #include "glog/logging.h"
 #include "paddle/fluid/framework/lod_tensor.h"
 #include "paddle/fluid/framework/lod_tensor_array.h"
-#include "paddle/fluid/platform/collective_helper.h"
-#include "paddle/fluid/platform/device_context.h"
 #include "pybind11/numpy.h"
 #include "pybind11/pybind11.h"
 #include "pybind11/stl.h"
@@ -46,40 +42,23 @@ constexpr int kNumValidIdx = 10;
 constexpr int kNumTensors = 11;
 
 template <typename T>
-static std::string ListToString(const T *ptr, size_t n) {
-  if (n == 0) return "[]";
-  std::stringstream ss;
-  ss << "[";
-  for (size_t i = 0; i < n; ++i) {
-    if (i > 0) ss << ", ";
-    ss << ptr[i];
-  }
-  ss << "]";
-  return ss.str();
-}
-
-template <typename T>
 std::vector<std::vector<framework::LoDTensorArray>>
-ProcessAllGatheredBERTInputsBase(const T *arr,
-                                 size_t length,
-                                 size_t num_samples,
-                                 size_t max_seq_length,
-                                 size_t batch_size,
-                                 size_t trainer_id,
-                                 size_t num_trainers,
-                                 bool drop_last,
-                                 bool load_balance) {
+ProcessAllGatheredBERTInputs(
+    const py::array_t<T, py::array::c_style | py::array::forcecast> &array,
+    size_t num_samples,
+    size_t max_seq_length,
+    size_t batch_size,
+    size_t trainer_id,
+    size_t num_trainers) {
   using TensorT = framework::LoDTensor;
 
-  const size_t nbatch = drop_last ? num_samples / batch_size
-                                  : (num_samples + batch_size - 1) / batch_size;
-  VLOG(10) << "num_samples = " << num_samples
-           << " , max_seq_length = " << max_seq_length
-           << " , batch_size = " << batch_size
-           << " , trainer_id = " << trainer_id
-           << " , num_trainers = " << num_trainers << " , nbatch = " << nbatch
-           << " , length = " << length;
+  PADDLE_ENFORCE_EQ(array.ndim(), 1);
+  size_t length = array.shape()[0];
+  const T *arr = array.data();
 
+  py::gil_scoped_release gil_release_guard;
+
+  const size_t nbatch = (num_samples + batch_size - 1) / batch_size;
   std::unique_ptr<T[]> seq_indices(new T[batch_size * num_trainers]);
 
   const size_t numel = num_samples * max_seq_length;
@@ -102,6 +81,14 @@ ProcessAllGatheredBERTInputsBase(const T *arr,
     return t->mutable_data<float>(platform::CPUPlace());
   };
 
+  VLOG(10) << "num_samples = " << num_samples;
+  VLOG(10) << "max_seq_length = " << max_seq_length;
+  VLOG(10) << "batch_size = " << batch_size;
+  VLOG(10) << "trainer_id = " << trainer_id;
+  VLOG(10) << "num_trainers = " << num_trainers;
+  VLOG(10) << "nbatch = " << nbatch;
+  VLOG(10) << "length= " << length;
+
   std::vector<std::vector<framework::LoDTensorArray>> gpu_cpu_tensors;
   std::vector<framework::LoDTensorArray> tensors(nbatch);
   std::vector<framework::LoDTensorArray> tensors_2(nbatch);
@@ -120,16 +107,12 @@ ProcessAllGatheredBERTInputsBase(const T *arr,
     std::sort(seq_indices.get(),
               seq_indices.get() + total_seq_length,
               [&](size_t idx1, size_t idx2) {
-                size_t real_idx1 = (idx1 / cur_bs) * num_per_device +
-                                   (idx1 % cur_bs) + seq_length_offset;
-                size_t real_idx2 = (idx2 / cur_bs) * num_per_device +
-                                   (idx2 % cur_bs) + seq_length_offset;
+                size_t real_idx1 = (idx1 % num_trainers) * num_per_device +
+                                   (idx1 / num_trainers) + seq_length_offset;
+                size_t real_idx2 = (idx2 % num_trainers) * num_per_device +
+                                   (idx2 / num_trainers) + seq_length_offset;
                 return arr[real_idx1] > arr[real_idx2];
               });
-
-    VLOG(10) << "Mini batch " << i << " " << cur_bs << " , seq_indices = "
-             << ListToString(seq_indices.get(), cur_bs * num_trainers);
-
     tensors[i].resize(kNumTensors);
     tensors_2[i].resize(1);
     auto *input_ids = resize_and_alloc(
@@ -162,13 +145,10 @@ ProcessAllGatheredBERTInputsBase(const T *arr,
     prefix_sum_seq_len[0] = 0;
     int sum_seq_len = 0;
     for (size_t j = 0; j < cur_bs; ++j) {
-      const size_t cur_trainer_id = (j % 2 != 0 && load_balance)
-                                        ? (num_trainers - 1 - trainer_id)
-                                        : trainer_id;
-      const size_t idx = seq_indices.get()[j * num_trainers + cur_trainer_id];
-      const size_t dev_id = idx / cur_bs;
+      const size_t idx = seq_indices.get()[j * num_trainers + trainer_id];
+      const size_t dev_id = idx % num_trainers;
       const T *data = arr + dev_id * num_per_device;
-      const size_t sample_id = idx % cur_bs + i * batch_size;
+      const size_t sample_id = idx / num_trainers + i * batch_size;
       std::memcpy(input_ids + j * max_seq_length,
                   data + sample_id * max_seq_length,
                   max_seq_length * sizeof(T));
@@ -240,35 +220,6 @@ ProcessAllGatheredBERTInputsBase(const T *arr,
 }
 
 template <typename T>
-std::vector<std::vector<framework::LoDTensorArray>>
-ProcessAllGatheredBERTInputs(
-    const py::array_t<T, py::array::c_style | py::array::forcecast> &array,
-    size_t num_samples,
-    size_t max_seq_length,
-    size_t batch_size,
-    size_t trainer_id,
-    size_t num_trainers,
-    bool drop_last,
-    bool load_balance) {
-  using TensorT = framework::LoDTensor;
-
-  int ndim = array.ndim();
-  PADDLE_ENFORCE_EQ(ndim, 1);
-  size_t length = array.shape()[0];
-  const T *arr = array.data();
-  py::gil_scoped_release guard;
-  return ProcessAllGatheredBERTInputsBase<T>(arr,
-                                             length,
-                                             num_samples,
-                                             max_seq_length,
-                                             batch_size,
-                                             trainer_id,
-                                             num_trainers,
-                                             drop_last,
-                                             load_balance);
-}
-
-template <typename T>
 std::vector<std::vector<framework::LoDTensorArray>> ProcessBERTEvalInputs(
     const py::array_t<T, py::array::c_style | py::array::forcecast> &array,
     size_t max_seq_length,
@@ -281,7 +232,7 @@ std::vector<std::vector<framework::LoDTensorArray>> ProcessBERTEvalInputs(
   size_t one_sample_len = array.shape()[1];
   const T *arr = array.data();
 
-  py::gil_scoped_release guard;
+  py::gil_scoped_release gil_release_guard;
 
   std::unique_ptr<size_t[]> seq_indices;
   if (need_sort) {
@@ -434,162 +385,6 @@ std::vector<std::vector<framework::LoDTensorArray>> ProcessBERTEvalInputs(
   return gpu_cpu_tensors;
 }
 
-class Timer {
- public:
-  using ClockType = std::chrono::high_resolution_clock;
-
-  explicit Timer(bool enable = true) : enable_(enable) { reset(); }
-
-  void reset() {
-    if (enable_) {
-      start_ = ClockType::now();
-    }
-  }
-
-  double elapsed_time() {
-    if (enable_) {
-      auto end = ClockType::now();
-      auto ms =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_)
-              .count() /
-          1.0e9;
-      return ms;
-    } else {
-      return -1.0;
-    }
-  }
-
- private:
-  std::chrono::time_point<ClockType> start_;
-  const bool enable_;
-};
-
-class CommBuffer {
- public:
-  CommBuffer(platform::CUDAPlace place,
-             int ring_id,
-             size_t nbytes,
-             size_t trainer_id,
-             size_t num_trainers) {
-    nbytes_ = nbytes;
-    num_trainers_ = num_trainers;
-    trainer_id_ = trainer_id;
-    PADDLE_ENFORCE_GPU_SUCCESS(cudaMalloc(&gpu_ptr_, nbytes_ * num_trainers_));
-    PADDLE_ENFORCE_GPU_SUCCESS(cudaHostAlloc(
-        &cpu_ptr_, nbytes_ * num_trainers_, cudaHostAllocPortable));
-    stream_ =
-        platform::DeviceContextPool::Instance().GetByPlace(place)->stream();
-
-    if (num_trainers > 1) {
-      comm_ = platform::NCCLCommContext::Instance().Get(ring_id, place)->comm();
-      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllReduce(
-          gpu_ptr_, gpu_ptr_, 1, ncclInt8, ncclSum, comm_, stream_));
-    } else {
-      comm_ = nullptr;
-    }
-
-    PADDLE_ENFORCE_GPU_SUCCESS(cudaStreamSynchronize(stream_));
-    VLOG(10) << "nbytes = " << nbytes_ << " , trainer_id = " << trainer_id
-             << " , num_trainers = " << num_trainers_;
-  }
-
-  ~CommBuffer() noexcept(false) {
-    PADDLE_ENFORCE_GPU_SUCCESS(cudaFree(gpu_ptr_));
-    PADDLE_ENFORCE_GPU_SUCCESS(cudaFreeHost(cpu_ptr_));
-  }
-
-  template <typename T>
-  std::vector<std::vector<framework::LoDTensorArray>> ExchangePadding(
-      const std::vector<
-          py::array_t<T, py::array::c_style | py::array::forcecast>> &array,
-      size_t num_samples,
-      size_t max_seq_length,
-      size_t batch_size,
-      bool drop_last,
-      bool load_balance) {
-    std::vector<std::pair<const void *, size_t>> input_metas;
-    input_metas.reserve(array.size());
-    for (const auto &arr : array) {
-      const void *cur_cpu_ptr = arr.data();
-      size_t cur_size = arr.size() * sizeof(T);
-      input_metas.emplace_back(cur_cpu_ptr, cur_size);
-    }
-
-    py::gil_scoped_release guard;
-    size_t total_nbytes = 0;
-    auto gpu_ptr = gpu_ptr_ + trainer_id_ * nbytes_;
-
-    constexpr auto kTimerLogLevel = 5;
-    bool enable_timer = VLOG_IS_ON(kTimerLogLevel);
-    Timer timer(enable_timer);
-    timer.reset();
-    for (size_t i = 0; i < input_metas.size(); ++i) {
-      const void *cur_cpu_ptr = input_metas[i].first;
-      size_t cur_size = input_metas[i].second;
-      if (num_trainers_ > 1) {
-        PADDLE_ENFORCE_GPU_SUCCESS(cudaMemcpyAsync(gpu_ptr + total_nbytes,
-                                                   cur_cpu_ptr,
-                                                   cur_size,
-                                                   cudaMemcpyHostToDevice,
-                                                   stream_));
-      } else {
-        std::memcpy(cpu_ptr_ + total_nbytes, cur_cpu_ptr, cur_size);
-      }
-      total_nbytes += cur_size;
-    }
-    PADDLE_ENFORCE_EQ(total_nbytes, nbytes_);
-
-    if (num_trainers_ > 1) {
-      if (enable_timer) {
-        PADDLE_ENFORCE_GPU_SUCCESS(cudaStreamSynchronize(stream_));
-        VLOG(kTimerLogLevel) << "H2D time: " << timer.elapsed_time();
-      }
-
-      timer.reset();
-      PADDLE_ENFORCE_GPU_SUCCESS(platform::dynload::ncclAllGather(
-          gpu_ptr, gpu_ptr_, nbytes_, ncclInt8, comm_, stream_));
-      if (enable_timer) {
-        PADDLE_ENFORCE_GPU_SUCCESS(cudaStreamSynchronize(stream_));
-        VLOG(kTimerLogLevel) << "AllGather time: " << timer.elapsed_time();
-      }
-
-      timer.reset();
-      PADDLE_ENFORCE_GPU_SUCCESS(cudaMemcpyAsync(cpu_ptr_,
-                                                 gpu_ptr_,
-                                                 nbytes_ * num_trainers_,
-                                                 cudaMemcpyDeviceToHost,
-                                                 stream_));
-      PADDLE_ENFORCE_GPU_SUCCESS(cudaStreamSynchronize(stream_));
-      if (enable_timer) {
-        VLOG(kTimerLogLevel) << "D2H time: " << timer.elapsed_time();
-      }
-    }
-
-    timer.reset();
-    auto ret = ProcessAllGatheredBERTInputsBase<T>(
-        reinterpret_cast<const T *>(cpu_ptr_),
-        total_nbytes / sizeof(T) * num_trainers_,
-        num_samples,
-        max_seq_length,
-        batch_size,
-        trainer_id_,
-        num_trainers_,
-        drop_last,
-        load_balance);
-    VLOG(kTimerLogLevel) << "Process data time: " << timer.elapsed_time();
-    return ret;
-  }
-
- private:
-  uint8_t *gpu_ptr_;
-  uint8_t *cpu_ptr_;
-  ncclComm_t comm_;
-  cudaStream_t stream_;
-  size_t nbytes_;
-  size_t trainer_id_;
-  size_t num_trainers_;
-};
-
 PYBIND11_MODULE(MLPERF_EXTENSION_NAME, m) {
   m.def("process_allgathered_inputs", &ProcessAllGatheredBERTInputs<int16_t>);
   m.def("process_allgathered_inputs", &ProcessAllGatheredBERTInputs<int32_t>);
@@ -597,10 +392,4 @@ PYBIND11_MODULE(MLPERF_EXTENSION_NAME, m) {
   m.def("process_eval_inputs", &ProcessBERTEvalInputs<int16_t>);
   m.def("process_eval_inputs", &ProcessBERTEvalInputs<int32_t>);
   m.def("process_eval_inputs", &ProcessBERTEvalInputs<int64_t>);
-
-  py::class_<CommBuffer>(m, "CommBuffer", "CommBuffer Class")
-      .def(py::init<platform::CUDAPlace, int, size_t, size_t, size_t>())
-      .def("exchange_padding", &CommBuffer::ExchangePadding<int16_t>)
-      .def("exchange_padding", &CommBuffer::ExchangePadding<int32_t>)
-      .def("exchange_padding", &CommBuffer::ExchangePadding<int64_t>);
 }

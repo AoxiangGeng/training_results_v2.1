@@ -17,12 +17,7 @@ import paddle.fluid.core as core
 from paddle.utils.cpp_extension import CUDAExtension, setup
 
 compile_dir = os.environ.get('COMPILE_DIR', '/limin29/Paddle/build')
-flash_attn_dir = os.environ.get('FLASH_ATTN_DIR', '/limin29/flash_attn')
-# compile_dir = "/root/paddlejob/workspace/env_run/Paddle/build"
-# flash_attn_dir = "/root/paddlejob/workspace/env_run/training_results_v2.0/HazyResearch/benchmarks/bert/implementations/pytorch/csrc/stream_attn"
-
 apex_dir = os.environ.get('APEX_DIR', '/limin29/apex/build_scripts')
-
 apex_lib_dir = '/usr/local/lib'
 
 define_macros = []
@@ -30,22 +25,13 @@ if core.is_compiled_with_mkldnn():
     define_macros.append(('PADDLE_WITH_MKLDNN', None))
 if core.is_compiled_with_nccl():
     define_macros.append(('PADDLE_WITH_NCCL', None))
-    define_macros.append(('THRUST_IGNORE_CUB_VERSION_CHECK', None))
-
-# define_macros.append(('PADDLE_USE_OPENBLAS', None))
-define_macros.append(('PADDLE_WITH_MKLML', None))
-
-cur_dir = os.path.dirname(os.path.abspath(__file__))
 
 setup(
     name='custom_setup_ops',
     ext_modules=CUDAExtension(
         sources=[
-            './fused_dense_op/fused_dense_impl.cu',
             './fused_dense_op/fused_dense_cuda.cc',
             './fused_dense_op/fused_dense_cuda.cu',
-            './fused_dense_op/fused_dense_gelu_dense_cuda.cc',
-            './fused_dense_op/fused_dense_gelu_dense_cuda.cu',
             './fused_dropout_residual_ln/fused_dropout_residual_ln_cuda.cc',
             './fused_dropout_residual_ln/fused_dropout_residual_ln_cuda.cu',
             './fmhalib/fmha_cuda.cc',
@@ -56,15 +42,10 @@ setup(
             './lr_op/lr_op_cuda.cu',
             './acc_merge/acc_merge.cc',
             './acc_merge/acc_merge.cu',
-            './flash_attn/flash_attn_cuda.cc',
-            './flash_attn/flash_attn_cuda.cu',
         ],
-        extra_objects=[
-            os.path.join(apex_lib_dir, 'libfmha.so'),
-            os.path.join(apex_lib_dir, 'libflash_attn.so')
-        ],
-        include_dirs=[apex_dir, flash_attn_dir, cur_dir],
+        extra_objects=[os.path.join(apex_lib_dir, 'libfmha.so')],
+        include_dirs=[apex_dir],
         library_dirs=[apex_lib_dir],
-        extra_link_args=['-lfmha', '-ldl', '-lcublas', '-lflash_attn'],
+        extra_link_args=['-lfmha', '-ldl', '-lcublas'],
         _compile_dir=compile_dir,
         define_macros=define_macros))

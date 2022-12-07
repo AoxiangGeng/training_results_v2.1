@@ -17,20 +17,34 @@ After preparation, you can see the directories are like:
 
 # Build the docker image
 
-You can run the following command to build the docker image. 
+We provide you two ways to build the docker image to run tests.
+
+## Build the docker image with pre-built binaries
+
+We built some necessary binaries beforehand, and you can build the docker image fast.
 
 ```
-bash Dockerfiles/build_image_from_scratch.sh
+bash Dockerfiles/build_image_fast.sh
 ```
 
-This command would take a long time. It contains the following steps:
+After the command finishes, you will get the docker image named `nvcr.io/nvidia/pytorch:22.04-py3-paddle-fast-test`.
+
+## Build the docker image from scratch
+
+This method would take long time. It would contain the following steps:
 
 - Build the docker image which can compile the PaddlePaddle source code.
 - Compile the PaddlePaddle source code.
 - Compile the PaddlePaddle external operators.
 - Compile the PaddlePaddle external pybind functions.
 
-After the command finishes, you will get the docker image named `nvcr.io/nvidia/pytorch:22.09-py3-paddle-dev-test`.
+You can run the step above by using the following command.
+
+```
+bash Dockerfiles/build_image_from_scratch.sh
+```
+
+After the command finishes, you will get the docker image named `nvcr.io/nvidia/pytorch:22.04-py3-paddle-dev-test`.
 
 # Prepare the checkpoint file
 
@@ -44,7 +58,7 @@ Originally, the checkpoint of the BERT model is generated from TensorFlow. We ca
 }
 ```
 
-In this way, we can run tests without installing TensorFlow again after conversion. You can use the following command to convert the original TensorFlow checkpoint file:
+In this way, we can run tests without install TensorFlow again after conversion. You can use the following command to convert the original TensorFlow checkpoint file:
 
 ```python
 python models/convert_tf_checkpoint.py \
@@ -52,34 +66,11 @@ python models/convert_tf_checkpoint.py \
     <BASE_DATA_DIR>/phase1/model.ckpt-28252.tf_pickled
 ```
 
-# Running the model using multiple nodes
-
-1. Start containers
-
-Start containers at all the nodes with the following command.
+# Run the tests
 
 ```
+export NEXP=10 # the trial test number
 export BASE_DATA_DIR=<your_bert_data_dir>
-export CONT_NAME=<your_container_name>
-export CONT=nvcr.io/nvidia/pytorch:22.09-py3-paddle-dev-test # the docker image name
-bash start_docker.sh
-```
-
-2. SSH/MPI configuration
-
-* MPI/SSH should be configured in all the containers in order to use `mpirun` to launch job from one container.
-* In order to clear cache for all the nodes from one node, we recommend to configure SSH authentication without password on the nodes, see `run_multi_node_with_docker.sh` for more.
-
-3. Run benchmark
-
-Run the following script in the first node, the training job will be launch in all the nodes by `mpirun`.
-
-```
-export PADDLE_TRAINER_ENDPOINTS=<node_ip_list> # all the ips of all nodes, separated by comma
-export PADDLE_TRAINER_PORTS=60000,60001,60002,60003,60004,60005,60006,60007 # the ports used by PaddlePaddle, one port per gpu
-export PADDLE_TRAINERS_NUM=8 # the number of nodes
-export CONT_NAME=<your_container_name>
-export NEXP=10 # the trial test number  
-
-bash run_multi_node_with_docker.sh
+export CONT=<your_docker_image_name>
+STAGE=run bash run_with_docker.sh
 ```

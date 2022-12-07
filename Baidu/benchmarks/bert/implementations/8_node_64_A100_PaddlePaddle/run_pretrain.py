@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from init_env import get_context, str2bool
+from init_env import get_context
 
 context = get_context()
 num_trainers = None
@@ -43,7 +43,6 @@ if context.is_trainer:
     import paddle
     import paddle.fluid.core as core
     import paddle.distributed.fleet as fleet
-    from paddle.fluid.memory_analysis import pre_allocate_memory
     from paddle.fluid.clip import _allow_pure_fp16_global_norm_clip
     from paddle.fluid.contrib.mixed_precision.fp16_utils import _keep_layer_norm_scale_bias_to_fp32
     from paddle.io import DataLoader, Dataset
@@ -65,12 +64,7 @@ if context.is_trainer:
         print('custom_setup_ops import error: {}'.format(e))
 
 
-def append_lr_op(base_lr,
-                 max_step,
-                 startup_warmup_step=0,
-                 warmup_step=0,
-                 end_lr=0.0,
-                 degree=1.0):
+def append_lr_op(base_lr, max_step):
     helper = LayerHelper('lr_op')
     step_var = paddle.fluid.layers.create_global_var(
         shape=[1], value=0, dtype='int64', persistable=True)
@@ -79,14 +73,8 @@ def append_lr_op(base_lr,
         type='custom_lr',
         inputs={'X': [step_var]},
         outputs={'Out': [lr_var]},
-        attrs={
-            'base_lr': base_lr,
-            'end_lr': end_lr,
-            'degree': degree,
-            'start_warmup_step': startup_warmup_step,
-            'warmup_step': warmup_step,
-            'max_step': max_step
-        })
+        attrs={'base_lr': base_lr,
+               'max_step': max_step})
     return lr_var, step_var
 
 
@@ -115,8 +103,7 @@ def append_acc_merge_op(eval_program, acc, total):
             inputs={'Acc': [acc],
                     'Total': [total]},
             outputs={'Out': [acc_out],
-                     'Step': [acc_step]},
-            attrs={'ring_id': 0 if num_trainers > 0 else -1})
+                     'Step': [acc_step]})
     scope = utility.get_scope()
     t = scope.var(acc_step.name).get_tensor()
     set_eval_step_func = lambda v: t.set(np.array([0, v], dtype=np.int64), paddle.CPUPlace())
@@ -135,6 +122,10 @@ def print_flags():
 
 def initial_loss_scale():
     return float(os.getenv("INIT_LOSS_SCALE", 2**20))
+
+
+def str2bool(s):
+    return True if distutils.util.strtobool(s) else False
 
 
 def parse_args():
@@ -274,11 +265,6 @@ def parse_args():
         default=False,
         help="Whether to use unpad_fmha_mke_opt optimization.")
     parser.add_argument(
-        "--use_flash_attn",
-        type=str2bool,
-        default=False,
-        help="Whether to use FlashAttn or APEX FMHA.")
-    parser.add_argument(
         "--pad_fmha",
         type=str2bool,
         default=False,
@@ -299,17 +285,14 @@ def parse_args():
         default=False,
         help="Whether to use fused_dropout_add_ln optimization.")
     parser.add_argument(
-        "--fused_dense_gelu_dense",
-        type=str2bool,
-        default=False,
-        help="Whether to use fused_dense_gelu_dense optimization.")
-    parser.add_argument(
         "--weight_transpose",
         type=str2bool,
         default=False,
         help="Whether the weight of linear is stored in tranpose format.")
     parser.add_argument(
         "--max_seq_length", type=int, default=512, help="The max seq length.")
+    parser.add_argument(
+        "--batch_size", type=int, default=56, help="The batch size.")
     parser.add_argument(
         "--num_epochs_to_generate_seeds_for",
         type=int,
@@ -330,16 +313,6 @@ def parse_args():
         type=str2bool,
         default=False,
         help="Whether to use CPU to do exchange padding.")
-    parser.add_argument(
-        "--exchange_padding_nbatch",
-        type=int,
-        default=None,
-        help="The number batches when exchange padding would perform at once.")
-    parser.add_argument(
-        "--local_exchange_padding",
-        type=str2bool,
-        default=False,
-        help="Whether to perform local or global exchange padding.")
     parser.add_argument(
         "--target_mlm_accuracy",
         type=float,
@@ -370,16 +343,6 @@ def parse_args():
         type=str2bool,
         default=False,
         help="Whether to sort the eval data.")
-    parser.add_argument(
-        "--nproc_per_node",
-        type=int,
-        default=-1,
-        help="The process number per node.")
-    parser.add_argument(
-        "--pre_allocated_memory_ratio",
-        type=float,
-        default=0.9,
-        help="Pre-allocated GPU memory ratio to avoid re-allocation.")
     args = parser.parse_args()
     return args
 
@@ -495,13 +458,11 @@ def dist_optimizer(args, optimizer):
             'tanh_grad',
             'transpose2',
             'custom_fmha',
-            'custom_fmha_grad',
+            'custom_fmha_grad'
             'custom_fused_dropout_residual_ln',
             'custom_fused_dropout_residual_ln_grad',
             'custom_fused_dense',
             'custom_fused_dense_grad',
-            'custom_fused_dense_gelu_dense',
-            'custom_fused_dense_gelu_dense_grad',
         ]
 
         custom_black_list = [
@@ -711,19 +672,6 @@ def recover_lamb_status(train_prog, args):
         assert found_cnt > 1
 
 
-def pre_allocate_gpu_memory(ratio):
-    p = paddle.device.cuda.get_device_properties()
-    # only pre-allocate memory on <=40G GPU machine
-    if p.total_memory > 40 * 1024 * 1024 * 1024:
-        return
-
-    limit = int(p.total_memory * ratio)
-    pre_allocate_memory(limit, utility.get_place())
-    if trainer_id == 0:
-        limit_in_gb = limit / 1024.0 / 1024 / 1024
-        print('Pre-allocated memory: {} GB'.format(limit_in_gb))
-
-
 def run_warmup(args,
                exe,
                train_prog,
@@ -804,15 +752,24 @@ def do_train(args):
     config.unpad = args.unpad
     config.unpad_fmha = args.unpad_fmha
     config.unpad_fmha_mke_opt = args.unpad_fmha_mke_opt
-    config.use_flash_attn = args.use_flash_attn
     config.pad_fmha = args.pad_fmha
     config.max_seq_length = args.max_seq_length
+    #config.pad = args.pad
+    #config.fuse_qkv = not args.disable_fuse_qkv
+    #config.fuse_scale = not args.disable_fuse_scale
+    #config.fuse_mask = not args.disable_fuse_mask 
+    #config.fuse_dropout = args.enable_fuse_dropout
     config.fused_dropout_add_ln = args.fused_dropout_add_ln
+    #config.apex_softmax = not args.disable_apex_softmax
+    #config.enable_stream = args.enable_stream
+    #if config.fuse_mask: config.apex_softmax = True
+    #if not config.pad: config.enable_stream = True
+    #if config.unpad: config.fused_mha = False
+
     config.unpad_embed = args.unpad_embed
-    config.fused_dense_gelu_dense = args.fused_dense_gelu_dense
 
     config.weight_transpose = args.weight_transpose
-    config.batch_size = args.train_batch_size
+    config.batch_size = args.batch_size
 
     # Padding for divisibility by 8
     if config.vocab_size % 8 != 0:
@@ -822,8 +779,6 @@ def do_train(args):
     assert config.vocab_size <= int16_max
     assert args.train_batch_size * args.max_seq_length <= int16_max
     assert args.eval_batch_size * args.max_seq_length <= int16_max
-    if not args.weight_transpose and args.fused_dense_gelu_dense:
-        assert False, "fused_dense_gelu_dense only supports weight_transpose is true now"
 
     def build_model():
         model = BertForPretraining(BertModel(config), config)
@@ -878,20 +833,13 @@ def do_train(args):
         grad_clip = None
     exclude_from_weight_decay_fn = lambda var: var.name not in decay_params
 
-    lr_var, step_var = append_lr_op(
-        base_lr=args.learning_rate,
-        max_step=args.max_steps,
-        startup_warmup_step=warmup_start,
-        warmup_step=warmup_steps,
-        end_lr=0.0,
-        degree=1.0)
+    lr_var, step_var = append_lr_op(args.learning_rate, args.max_steps)
     optimizer_kwargs = {
         'learning_rate': lr_var,
         'lamb_weight_decay': args.weight_decay_rate,
         'epsilon': args.lamb_epsilon,
         'exclude_from_weight_decay_fn': exclude_from_weight_decay_fn,
         'grad_clip': grad_clip,
-        'use_hierarchical_allreduce': False,
         'beta1': args.opt_lamb_beta_1,
         'beta2': args.opt_lamb_beta_2,
     }
@@ -915,13 +863,10 @@ def do_train(args):
             "use_master_param_norm": True,
             "clip_after_allreduce": False,
             "is_grad_scaled_by_nranks": False,
-            "nproc_per_node": args.nproc_per_node
-            if args.nproc_per_node > 0 else None,
         })
         if args.gradient_accumulation_steps > 1:
             optimizer_kwargs.update({
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                "use_master_acc_grad": False,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps
             })
         optimizer = DistributedFusedLamb(**optimizer_kwargs)
         optimizer._set_step(step_var)
@@ -946,12 +891,6 @@ def do_train(args):
     optimizer = dist_optimizer(args, optimizer)
     optimizer.minimize(loss)
 
-    with open('startup_program_{}.txt'.format(trainer_id), 'w') as f:
-        f.write(str(startup_program))
-
-    with open('main_program_{}.txt'.format(trainer_id), 'w') as f:
-        f.write(str(main_program))
-
     # Define the Executor for running the static model
     exe = paddle.static.Executor(place)
     exe.run(startup_program)
@@ -961,6 +900,12 @@ def do_train(args):
 
     eval_fetch_list, set_eval_step = append_acc_merge_op(eval_program, mlm_acc,
                                                          num_masked)
+
+    with open('startup_program_{}.txt'.format(trainer_id), 'w') as f:
+        f.write(str(startup_program))
+
+    with open('main_program_{}.txt'.format(trainer_id), 'w') as f:
+        f.write(str(main_program))
 
     with open('eval_program_{}.txt'.format(trainer_id), 'w') as f:
         f.write(str(eval_program))
@@ -1023,8 +968,6 @@ def do_train(args):
     create_train_dataset = create_cpu_exchange_padding_pretraining_dataset if args.cpu_exchange_padding else create_pretraining_dataset
 
     context.trainer_comm.Barrier()
-    context.prepare_comm_buffer()
-
     if trainer_id == 0:
         paddle_bert_print_end(key=constants.INIT_STOP)
         paddle_bert_print_start(key=constants.RUN_START)
@@ -1049,9 +992,6 @@ def do_train(args):
     epoch = 1  # to be consistent with NV
 
     file_num = context.file_num()
-
-    os.environ["NCCL_SHARP_DISABLE"] = "1"
-    os.environ["NCCL_COLLNET_ENABLE"] = "0"
 
     while global_step < args.max_steps and not end_training:
         if trainer_id == 0:
@@ -1146,7 +1086,6 @@ def do_train(args):
                                     "eval_mlm_accuracy": eval_avg_mlm_accuracy
                                 })
 
-                samples_trained = global_step * args.train_batch_size * args.gradient_accumulation_steps * num_trainers
                 if args.log_freq > 0 and training_steps % (
                         args.log_freq * args.gradient_accumulation_steps) == 0:
                     samples_trained = global_step * args.train_batch_size * args.gradient_accumulation_steps * num_trainers
@@ -1247,7 +1186,7 @@ if __name__ == "__main__":
         if trainer_id == 0:
             paddle_bert_print_event(key=constants.SUBMISSION_ORG, val="Baidu")
             paddle_bert_print_event(
-                key=constants.SUBMISSION_PLATFORM, val="64 x NVIDIA A100 GPU")
+                key=constants.SUBMISSION_PLATFORM, val="1 x NVIDIA A100 GPU")
             paddle_bert_print_event(
                 key=constants.SUBMISSION_DIVISION, val="closed")
             paddle_bert_print_event(
@@ -1263,7 +1202,6 @@ if __name__ == "__main__":
             assert args.use_amp, "--use_amp must be True if --use_pure_fp16 is True"
         paddle.enable_static()
         with paddle.static.scope_guard(utility.get_scope()):
-            pre_allocate_gpu_memory(args.pre_allocated_memory_ratio)
             do_train(args)
     else:
         if args.cpu_exchange_padding:

@@ -22,7 +22,7 @@ run_test() {
   for i in `seq $2`
   do
     bash run_and_time.sh;
-    dst_dir=log_8_xxx_$i
+    dst_dir=log_8_allopt_xxx_$i
     rm -rf $dst_dir;
     mv log_8 $dst_dir;
     sleep 10
@@ -31,9 +31,8 @@ run_test() {
 }
 
 # TODO: change the following directory to your codebase path    
-#PADDLE_DIR="/data2/zengjinle/mlperf/v2.0/benchmarks/bert/implementations"
-PADDLE_DIR="/data2/zengjinle/mlperf_2.0_submission/mlperf/v2.0/benchmarks/bert/implementations/8_node_64_A100_PaddlePaddle"
+PADDLE_DIR="/data2/zengjinle/mlperf/v2.0/benchmarks/bert/implementations"
 NV_DIR="/data2/zengjinle/submission_training_1.1/NVIDIA/benchmarks/bert/implementations/pytorch"
 
-run_test $PADDLE_DIR 30
+run_test $PADDLE_DIR 10
 run_test $NV_DIR 20

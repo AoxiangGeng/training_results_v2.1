@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "common_headers.h"  // NOLINT
-#include "fmhalib.h"         // NOLINT
+#include "fmhalib.h"  // NOLINT
+#include "paddle/extension.h"
+#include "paddle/fluid/operators/dropout_impl_util.h"
+#include "paddle/fluid/platform/device_context.h"
+#include "paddle/fluid/platform/enforce.h"
 
 #define CHECK_FMHALIB_ERROR()                          \
   do {                                                 \
@@ -23,7 +26,8 @@
     }                                                  \
   } while (0)
 
-static const phi::GPUContext& GetCurrentCUDADeviceContext() {
+static const paddle::platform::CUDADeviceContext&
+GetCurrentCUDADeviceContext() {
   auto dev_id = paddle::platform::GetCurrentDeviceId();
   paddle::platform::CUDAPlace place(dev_id);
   return *paddle::platform::DeviceContextPool::Instance().GetByPlace(place);

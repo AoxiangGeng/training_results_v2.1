@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "common_headers.h"  // NOLINT
+#include "paddle/fluid/framework/custom_raw_op_kernel_func.h"
 
 template <typename T, bool NeedAccumulate>
 static __device__ __forceinline__ void AccMerge(T acc, T total, T *out) {
@@ -59,35 +59,26 @@ __PD_DEFINE_RAW_OP_KERNEL_FUNC(acc_merge, ctx) {
 
   auto &out_t = *ctx.Output<f::Tensor>("Out");
   out_t.Resize({2});
-  auto place = acc_t.place();
-  auto *out = out_t.mutable_data<Type2>(place);
+  auto *out = out_t.mutable_data<Type2>(acc_t.place());
 
   auto stream = ctx.cuda_device_context().stream();
   if (step[0] == 0) {
     if (is_cpu_place) {
-      AccMergeKernelCPUTotal<Type1, Type2, false>
-          <<<1, 1, 0, stream>>>(acc, *total_t.data<int64_t>(), out);
+      AccMergeKernelCPUTotal<Type1, Type2, false><<<1, 1, 0, stream>>>(
+          acc, *total_t.data<int64_t>(), out);
     } else {
-      AccMergeKernelGPUTotal<Type1, Type2, false>
-          <<<1, 1, 0, stream>>>(acc, total_t.data<float>(), out);
+      AccMergeKernelGPUTotal<Type1, Type2, false><<<1, 1, 0, stream>>>(
+          acc, total_t.data<float>(), out);
     }
   } else {
     if (is_cpu_place) {
-      AccMergeKernelCPUTotal<Type1, Type2, true>
-          <<<1, 1, 0, stream>>>(acc, *total_t.data<int64_t>(), out);
+      AccMergeKernelCPUTotal<Type1, Type2, true><<<1, 1, 0, stream>>>(
+          acc, *total_t.data<int64_t>(), out);
     } else {
-      AccMergeKernelGPUTotal<Type1, Type2, true>
-          <<<1, 1, 0, stream>>>(acc, total_t.data<Type1>(), out);
+      AccMergeKernelGPUTotal<Type1, Type2, true><<<1, 1, 0, stream>>>(
+          acc, total_t.data<Type1>(), out);
     }
   }
 
   step[0] = (step[0] + 1) % step[1];
-  if (step[0] == 0) {
-    auto ring_id = ctx.Attr<int>("ring_id");
-    if (ring_id >= 0) {
-      auto comm = p::NCCLCommContext::Instance().Get(ring_id, place)->comm();
-      PADDLE_ENFORCE_GPU_SUCCESS(p::dynload::ncclAllReduce(
-          out, out, 2, ncclFloat64, ncclSum, comm, stream));
-    }
-  }
 }

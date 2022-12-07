@@ -34,9 +34,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -D_GLIBCXX_USE_CXX11_ABI=1 -f
 
 set(extension_name "functions")
 add_definitions("-DMLPERF_EXTENSION_NAME=${extension_name}")
-add_definitions("-DTHRUST_IGNORE_CUB_VERSION_CHECK")
 pybind11_add_module(${extension_name} functions.cc)
-target_link_libraries(${extension_name} PRIVATE %s /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so)
+target_link_libraries(${extension_name} PRIVATE %s)
 '''
 
 compile_dir = os.environ["COMPILE_DIR"]
@@ -57,11 +56,7 @@ macros = "\n".join([
     for k, v in macros.items()
 ])
 
-paddle_so = None
-for so_name in ['libpaddle.so', 'core_avx.so', 'core_noavx.so']:
-    paddle_so = os.path.join(os.path.dirname(paddle.__file__), 'fluid', so_name)
-    if os.path.exists(paddle_so):
-        break
+paddle_so = os.path.join(os.path.dirname(paddle.__file__), "fluid/core_avx.so")
 cmakelists_context = CMAKELISTS_TEMPLATE % ("\n".join(dirs), macros, paddle_so)
 
 with open("CMakeLists.txt", "w") as f:
