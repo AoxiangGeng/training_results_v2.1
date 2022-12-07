@@ -28,11 +28,6 @@ std::vector<paddle::DataType> LrInferDtype(paddle::DataType x_dtype) {
 PD_BUILD_OP(custom_lr)
     .Inputs({"X"})
     .Outputs({"Out"})
-    .Attrs({"base_lr: float",
-            "end_lr: float",
-            "degree: float",
-            "warmup_step: int64_t",
-            "start_warmup_step: int64_t",
-            "max_step: int64_t"})
+    .Attrs({"base_lr: float", "max_step: int64_t"})
     .SetInferShapeFn(PD_INFER_SHAPE(LrInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(LrInferDtype));

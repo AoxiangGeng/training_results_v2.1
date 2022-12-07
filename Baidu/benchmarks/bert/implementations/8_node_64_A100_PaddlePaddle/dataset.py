@@ -104,7 +104,6 @@ def create_cpu_exchange_padding_pretraining_dataset(data_holders,
         capacity=len(data[0]),
         return_list=False,
         drop_last=False)
-
     train_data_loader.set_batch_generator(
         lambda: data[0], places=[reader_place])
     if tolist:

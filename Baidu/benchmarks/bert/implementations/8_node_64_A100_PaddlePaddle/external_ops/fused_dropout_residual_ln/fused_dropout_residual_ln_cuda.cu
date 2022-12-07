@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "common_headers.h"  // NOLINT
+#include "paddle/extension.h"
+#include "paddle/fluid/framework/custom_raw_op_kernel_func.h"
+#include "paddle/fluid/operators/fused/fused_dropout_helper.h"
 
 __PD_DEFINE_RAW_OP_KERNEL_FUNC(custom_fused_dropout_residual_ln, ctx) {
   namespace f = paddle::framework;

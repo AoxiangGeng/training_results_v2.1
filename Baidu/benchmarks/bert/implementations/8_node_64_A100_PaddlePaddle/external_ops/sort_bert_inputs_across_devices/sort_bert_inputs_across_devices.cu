@@ -15,8 +15,16 @@
 #include <cstdint>
 #include <iostream>
 #include <sstream>
-
-#include "common_headers.h"  // NOLINT
+#include "glog/logging.h"
+#include "paddle/extension.h"
+#include "paddle/fluid/framework/tensor.h"
+#include "paddle/fluid/memory/malloc.h"
+#include "paddle/fluid/operators/kernel_primitives/kernel_primitives.h"
+#include "paddle/fluid/operators/reduce_ops/reduce_op.cu.h"
+#include "paddle/fluid/platform/collective_helper.h"
+#include "paddle/fluid/platform/device_context.h"
+#include "paddle/fluid/platform/enforce.h"
+#include "paddle/fluid/platform/for_range.h"
 
 namespace framework = paddle::framework;
 namespace operators = paddle::operators;
@@ -322,8 +330,8 @@ std::vector<paddle::Tensor> GPUSortBERTInputsAcrossDevicesWithDType(
   int gbs = num_devices * max_batch_size;
   allgather_input_mask.Resize({gbs, seq_len});
   T *allgather_input_mask_ptr = allgather_input_mask.mutable_data<T>(place);
-  platform::ForRange<phi::GPUContext> retrieve_mask_for_range(dev_ctx,
-                                                              num_devices * n);
+  platform::ForRange<platform::CUDADeviceContext> retrieve_mask_for_range(
+      dev_ctx, num_devices * n);
   int input_mask_offset = 2 * n;
   retrieve_mask_for_range(
       RetrieveAllGatheredInputMaskFunctor<T>(allgather_buf_ptr,
@@ -351,7 +359,7 @@ std::vector<paddle::Tensor> GPUSortBERTInputsAcrossDevicesWithDType(
   using IndexT = int;
   auto indices = memory::Alloc(place, gbs * sizeof(IndexT));
   auto *indices_ptr = reinterpret_cast<IndexT *>(indices->ptr());
-  platform::ForRange<phi::GPUContext> itoa_for_range(dev_ctx, gbs);
+  platform::ForRange<platform::CUDADeviceContext> itoa_for_range(dev_ctx, gbs);
   itoa_for_range(IotaFunctor<IndexT>(indices_ptr));
   auto sorted_indices = memory::Alloc(place, gbs * sizeof(IndexT));
   auto *sorted_indices_ptr = reinterpret_cast<IndexT *>(sorted_indices->ptr());
@@ -450,8 +458,8 @@ std::vector<paddle::Tensor> GPUSortBERTInputsAcrossDevicesWithDType(
                                           nsl_out_shape);
 
   VLOG(10) << "starts to reorder";
-  platform::ForRange<phi::GPUContext> reorder_for_range(dev_ctx,
-                                                        new_bs * seq_len);
+  platform::ForRange<platform::CUDADeviceContext> reorder_for_range(
+      dev_ctx, new_bs * seq_len);
   ReorderBERTInputTensorsFunctor<T, IndexT> reorder_functor(
       allgather_buf_ptr,
       sorted_indices_ptr,

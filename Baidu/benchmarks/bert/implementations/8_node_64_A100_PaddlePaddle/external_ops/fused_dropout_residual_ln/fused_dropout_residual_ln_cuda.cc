@@ -16,10 +16,10 @@
 #include "paddle/extension.h"
 
 std::vector<std::vector<int64_t>> FusedDropoutResidualLnInferShape(
-    const std::vector<int64_t> &x_shape,
-    const std::vector<int64_t> &residual_shape,
-    const std::vector<int64_t> &ln_scale_shape,
-    const std::vector<int64_t> &ln_bias_shape) {
+    const std::vector<int64_t>& x_shape,
+    const std::vector<int64_t>& residual_shape,
+    const std::vector<int64_t>& ln_scale_shape,
+    const std::vector<int64_t>& ln_bias_shape) {
   int x_m = 1;
   for (int i = 0; i < x_shape.size() - 1; i++) {
     x_m *= x_shape[i];
@@ -44,17 +44,6 @@ std::vector<paddle::DataType> FusedDropoutResidualLnInferDtype(
           x_dtype};
 }
 
-std::vector<std::vector<int64_t>> FusedDropoutResidualLnGradInferShape(
-    const std::vector<int64_t> &ln_scale_shape,
-    const std::vector<int64_t> &ln_bias_shape,
-    const std::vector<int64_t> &dropout_mask_shape,
-    const std::vector<int64_t> &ln_mean_shape,
-    const std::vector<int64_t> &ln_var_shape,
-    const std::vector<int64_t> &dropout_residual_out_shape,
-    const std::vector<int64_t> &grad_out_shape) {
-  return {grad_out_shape, grad_out_shape, ln_scale_shape, ln_bias_shape};
-}
-
 PD_BUILD_OP(custom_fused_dropout_residual_ln)
     .Inputs({"X", "Residual", "LnScale", "LnBias"})
     .Outputs({"Out", "DropoutMask", "LnMean", "LnVar", "DropoutResidualOut"})
@@ -68,7 +57,9 @@ PD_BUILD_OP(custom_fused_dropout_residual_ln)
     .SetInferDtypeFn(PD_INFER_DTYPE(FusedDropoutResidualLnInferDtype));
 
 PD_BUILD_GRAD_OP(custom_fused_dropout_residual_ln)
-    .Inputs({"LnScale",
+    .Inputs({"X",
+             "Residual",
+             "LnScale",
              "LnBias",
              "DropoutMask",
              "LnMean",
@@ -84,5 +75,4 @@ PD_BUILD_GRAD_OP(custom_fused_dropout_residual_ln)
             "fix_seed: bool",
             "seed_val: int",
             "is_upscale_in_train: bool",
-            "dropout_rate: float"})
-    .SetInferShapeFn(PD_INFER_SHAPE(FusedDropoutResidualLnGradInferShape));
+            "dropout_rate: float"});

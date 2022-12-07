@@ -13,26 +13,19 @@
 # limitations under the License.
 
 import os
-import distutils.util
 from mpi4py import MPI
 import numpy as np
 import time
 import paddle
-from pybind.functions import CommBuffer
 from pybind.functions import process_allgathered_inputs as process_bert_inputs
 from pybind.functions import process_eval_inputs as process_bert_eval_inputs
 import h5py
 import random
-import concurrent.futures as futures
 
 global_comm = MPI.COMM_WORLD
 global_rank = global_comm.rank
 global_world_size = global_comm.size
 assert global_world_size % 2 == 0
-
-
-def str2bool(s):
-    return True if distutils.util.strtobool(s) else False
 
 
 def create_group_comm(ranks):
@@ -179,38 +172,22 @@ class WorkerInitObj(object):
         random.seed(self.seed + id)
 
 
-def str_split(s, delim=','):
-    return [item.strip() for item in s.split(delim) if item.strip()]
-
-
 class Context:
     def __init__(self):
-        self.trainer_id = int(os.getenv('PADDLE_TRAINER_ID'))
-        self.trainer_num = int(os.getenv('PADDLE_TRAINERS_NUM'))
-        self.is_trainer = str2bool(os.getenv('IS_TRAINER'))
-
-        self.is_local_mpirun = str2bool(os.getenv('MPIRUN_LOCAL', '0'))
+        half_size = int(global_world_size / 2)
+        self.trainer_id = global_rank % half_size
+        self.trainer_num = half_size
+        self.is_trainer = (global_rank < half_size)
 
         self.reader_id = self.trainer_id
         self.reader_num = self.trainer_num
         self.is_reader = not self.is_trainer
 
-        self.trainer_ranks = [
-            int(s) for s in str_split(os.getenv('MPI_TRAINER_RANKS'))
-        ]
-        self.reader_ranks = [
-            int(s) for s in str_split(os.getenv('MPI_READER_RANKS'))
-        ]
-        self.trainer_comm = create_group_comm(self.trainer_ranks)
-        if self.is_local_mpirun:
-            self.reader_comm = create_group_comm(self.reader_ranks)
-        else:
-            self.reader_comm = None
-
-        self.trainer_reader_comm = create_group_comm([
-            int(os.getenv('MPI_TRAINER_RANK')),
-            int(os.getenv('MPI_READER_RANK'))
-        ])
+        self.trainer_comm = create_group_comm(range(0, half_size))
+        self.reader_comm = create_group_comm(
+            range(half_size, global_world_size))
+        self.trainer_reader_comm = create_group_comm(
+            [self.trainer_id, self.trainer_id + half_size])
         self.global_comm = global_comm
 
     def init_args(self, args, dtype=np.int16):
@@ -225,78 +202,14 @@ class Context:
             self.num_samples = np.array(f["next_sentence_labels"][:]).size
 
         self.batch_size = args.train_batch_size
-        self.num_batch = int(
-            (self.num_samples + self.batch_size - 1) / self.batch_size)
         self.max_seq_length = args.max_seq_length
         self.worker_seeds, self.shuffling_seeds = self._setup_seeds(
             args.seed, args.num_epochs_to_generate_seeds_for)
-        self.epoch_idx = 1
+        self.epoch_idx = 0
 
-        if args.local_exchange_padding:
-            if args.nproc_per_node == len(self.reader_ranks):
-                args.local_exchange_padding = False
-
-        if self.is_local_mpirun:
-            args.local_exchange_padding = True
-
-        if args.local_exchange_padding:
-            if self.reader_comm is None:
-                assert args.nproc_per_node > 0
-                reader_group_id = int(self.reader_id / args.nproc_per_node)
-                start_reader_id = reader_group_id * args.nproc_per_node
-                end_reader_id = start_reader_id + args.nproc_per_node
-                reader_ids = [
-                    self.reader_ranks[i]
-                    for i in range(start_reader_id, end_reader_id)
-                ]
-                self.reader_comm = create_group_comm(reader_ids)
-
-            self.local_trainer_id = self.trainer_id % args.nproc_per_node
-            self.local_trainer_num = args.nproc_per_node
-        else:
-            if self.reader_comm is None:
-                self.reader_comm = create_group_comm(self.reader_ranks)
-            self.local_trainer_id = self.trainer_id
-            self.local_trainer_num = len(self.reader_ranks)
-
-        self.comm_nbatch = args.exchange_padding_nbatch
-        if self.comm_nbatch is not None and self.comm_nbatch * self.batch_size >= self.num_samples:
-            self.comm_nbatch = None
-            args.exchange_padding_nbatch = None
-
-        if self.comm_nbatch is None:
-            each_num_samples = self.num_samples
-        else:
-            each_num_samples = self.comm_nbatch * self.batch_size
-
-        total_data_buf_size = self.num_samples * 4 * self.max_seq_length + self.num_samples * 2
-        each_data_buf_size = each_num_samples * 4 * self.max_seq_length + each_num_samples * 2
-        data_buf_num = int(total_data_buf_size / each_data_buf_size)
-        self.data_buf = []
-        self.sample_indices = []
-        for i in range(data_buf_num):
-            self.data_buf.append(
-                np.empty(
-                    shape=[self.local_trainer_num * each_data_buf_size],
-                    dtype=dtype))
-            self.sample_indices.append((i * each_num_samples,
-                                        (i + 1) * each_num_samples))
-        last_data_buf_size = total_data_buf_size % each_data_buf_size
-        if last_data_buf_size != 0:
-            self.data_buf.append(
-                np.empty(
-                    shape=[self.local_trainer_num * last_data_buf_size],
-                    dtype=dtype))
-            self.sample_indices.append(
-                (data_buf_num * each_num_samples, self.num_samples))
-        self.data_dtype = self.data_buf[0].dtype
-        if self.comm_nbatch is None:
-            assert len(self.data_buf) == 1
-            self.data_buf = self.data_buf[0]
-            self.thread_pool = None
-        else:
-            assert len(self.data_buf) > 1
-            self.thread_pool = futures.ThreadPoolExecutor(max_workers=1)
+        data_buf_size = self.num_samples * 4 * self.max_seq_length + self.num_samples * 2
+        self.data_buf = np.empty(
+            shape=[self.trainer_num * data_buf_size], dtype=dtype)
 
         self.eval_dir = args.eval_dir
         self.num_eval_examples = args.num_eval_examples
@@ -307,7 +220,6 @@ class Context:
         random.seed(cur_seed)
         paddle.seed(cur_seed)
         self.worker_init = WorkerInitObj(cur_seed)
-        self.comm_buffer = None
         self.barrier()
 
     def shuffle_files(self):
@@ -348,87 +260,35 @@ class Context:
     def file_num(self):
         return len(self.files)
 
-    def _obtain_train_data(self, buf, num_samples):
-        drop_last = True
-        load_balance = False
-        self.trainer_reader_comm.Recv(buf, source=1)
-        return process_bert_inputs(buf, num_samples, self.max_seq_length,
-                                   self.batch_size, self.local_trainer_id,
-                                   self.local_trainer_num, drop_last,
-                                   load_balance)
-
-    def prepare_comm_buffer(self):
-        if self.comm_buffer is not None:
-            return
-
-        from utility import get_place
-        ring_id = 1 if self.args.local_exchange_padding else 0
-        nbytes = self.num_samples * self.max_seq_length * 4 + self.num_samples * 2
-        nbytes *= self.data_dtype.itemsize
-        self.comm_buffer = CommBuffer(get_place(), ring_id, nbytes,
-                                      self.local_trainer_id,
-                                      self.local_trainer_num)
-
-    def read_first_file(self):
-        fname = select_dataset_file_for_each_worker(
-            self.files, 0, self.trainer_num, self.trainer_id)
-        data = read_hdf5_file(fname, dtype=self.data_dtype)
-        drop_last = True
-        load_balance = False
-        return self.comm_buffer.exchange_padding(
-            data, self.num_samples, self.max_seq_length, self.batch_size,
-            drop_last, load_balance)
-
     def read_file(self, f_id=None):
         if self.is_trainer:
             self.fid_buf[0] = f_id
             self.trainer_reader_comm.Isend(self.fid_buf, dest=1)
             if f_id == 0:
                 self.shuffle_files()
-                return self.read_first_file()
             elif f_id < 0:
                 return
 
-            if self.comm_nbatch is None:
-                return self._obtain_train_data(self.data_buf, self.num_samples)
-            else:
-                tasks = []
-                for i, (start_idx, end_idx) in enumerate(self.sample_indices):
-                    cur_num_samples = end_idx - start_idx
-                    tasks.append(
-                        self.thread_pool.submit(self._obtain_train_data, self.
-                                                data_buf[i], cur_num_samples))
+            self.trainer_reader_comm.Recv(self.data_buf, source=1)
+            results = process_bert_inputs(self.data_buf, self.num_samples,
+                                          self.max_seq_length, self.batch_size,
+                                          self.trainer_id, self.trainer_num)
 
-                results = [[], []]
-                for task in tasks:
-                    gpu_data, cpu_data = task.result()
-                    results[0].extend(gpu_data)
-                    results[1].extend(cpu_data)
-
-                return results
+            return results
         else:
             self.trainer_reader_comm.Recv(self.fid_buf, 0)
             f_id = self.fid_buf[0]
             if f_id == 0:
                 self.shuffle_files()
-                return True
             elif f_id < 0:
                 return False
 
             fname = select_dataset_file_for_each_worker(
                 self.files, f_id, self.trainer_num, self.trainer_id)
-            data = read_hdf5_file(fname, dtype=self.data_dtype)
-
-            if self.comm_nbatch is None:
-                send_buf = np.concatenate([d.flatten() for d in data])
-                self.reader_comm.Allgather(send_buf, self.data_buf)
-                self.trainer_reader_comm.Send(self.data_buf, dest=0)
-            else:
-                for i, (start_idx, end_idx) in enumerate(self.sample_indices):
-                    send_buf = np.concatenate(
-                        [d[start_idx:end_idx].flatten() for d in data])
-                    self.reader_comm.Allgather(send_buf, self.data_buf[i])
-                    self.trainer_reader_comm.Send(self.data_buf[i], dest=0)
+            data = read_hdf5_file(fname, dtype=self.data_buf.dtype)
+            send_buf = np.concatenate([d.flatten() for d in data])
+            self.reader_comm.Allgather(send_buf, self.data_buf)
+            self.trainer_reader_comm.Send(self.data_buf, dest=0)
             return True
 
     def read_eval_file(self):
@@ -439,7 +299,7 @@ class Context:
                 eval_file_path = os.path.join(self.eval_dir, eval_file)
                 if os.path.isfile(eval_file_path) and 'part' in eval_file_path:
                     data = read_eval_hdf5_file(
-                        eval_file_path, dtype=self.data_dtype)
+                        eval_file_path, dtype=self.data_buf.dtype)
                     eval_data.extend(data)
                     if len(eval_data) > self.num_eval_examples:
                         break
